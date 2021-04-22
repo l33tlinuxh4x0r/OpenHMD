@@ -18,7 +18,7 @@
 #define HP_VID           0x03f0
 #define REVERB_PID       0x0c6a
 #define REVERB_G2_PID    0x0580
- 
+
 #include <string.h>
 #include <wchar.h>
 #include <hidapi.h>
@@ -34,21 +34,53 @@
 
 typedef struct wmr_priv wmr_priv;
 
+static bool init_reverb(wmr_priv *priv);
+static void deinit_reverb(wmr_priv *priv);
+
+enum wmr_headset_type {
+	WMR_HEADSET_GENERIC,
+	WMR_HEADSET_REVERB_G1,
+	WMR_HEADSET_REVERB_G2,
+	WMR_HEADSET_SAMSUNG_800ZAA
+};
+
+struct wmr_headset_info {
+	enum wmr_headset_type hmd_type;
+
+	/* String by which we recognise the device */
+	const char *dev_id_str;
+	/* Friendly ID string for debug */
+	const char *debug_name;
+
+	/* VID/PID of the auxilliary control device, if any (0x0,0x0 if none) */
+	unsigned short vid;
+	unsigned short pid;
+
+	bool (*init_func)(wmr_priv *priv);
+	void (*deinit_func)(wmr_priv *priv);
+};
+
+const struct wmr_headset_info headset_map[] = {
+		{ WMR_HEADSET_GENERIC, NULL, "Unknown WMR HMD", 0x0, 0x0, NULL, NULL }, /* Catch-all for unknown headsets */
+		{ WMR_HEADSET_REVERB_G1, "HP Reverb VR Headset VR1000-2xxx", "HP Reverb", HP_VID, REVERB_PID, init_reverb, deinit_reverb },
+		{ WMR_HEADSET_REVERB_G2, "HP Reverb Virtual Reality Headset G2", "HP Reverb G2", HP_VID, REVERB_G2_PID, init_reverb, deinit_reverb },
+		{ WMR_HEADSET_SAMSUNG_800ZAA, "Samsung Windows Mixed Reality 800ZAA", "Samsung Odyssey", 0, 0, NULL, NULL },
+};
+const int headset_map_n = sizeof(headset_map) / sizeof(headset_map[0]);
+
 struct wmr_priv {
 	ohmd_device base;
+	const struct wmr_headset_info *hmd_info;
 
 	hid_device* hmd_imu;
 
 	hid_device* hmd_aux;
-
-	void (* deinit_func)(wmr_priv *priv);
 
 	fusion sensor_fusion;
 	vec3f raw_accel, raw_gyro;
 	uint32_t last_ticks;
 	uint8_t last_seq;
 	hololens_sensors_packet sensor;
-
 };
 
 static void vec3f_from_hololens_gyro(int16_t smp[3][32], int i, vec3f* out_vec)
@@ -176,8 +208,8 @@ static void close_device(ohmd_device* device)
 	hid_close(priv->hmd_imu);
 
 	if (priv->hmd_aux) {
-		if (priv->deinit_func) {
-			priv->deinit_func(priv);
+		if (priv->hmd_info->deinit_func) {
+			priv->hmd_info->deinit_func(priv);
 		}
 		hid_close(priv->hmd_aux);
 	}
@@ -376,66 +408,60 @@ void resetList(const nx_json* (*list)[32])
 }
 
 static void deinit_reverb(wmr_priv *priv) {
-    hid_device *hid = priv->hmd_aux;
+	hid_device *hid = priv->hmd_aux;
 
-    /* Turn the screen off */
-    unsigned char cmd_2[2] = { 0x04, 0x00 };
-    hid_send_feature_report(hid, cmd_2, sizeof(cmd_2));
+	/* Turn the screen off */
+	unsigned char cmd_2[2] = { 0x04, 0x00 };
+	hid_send_feature_report(hid, cmd_2, sizeof(cmd_2));
 }
 
 static bool init_reverb(wmr_priv *priv) {
-    LOGI("Starting Reverb/Reverb G2 initialization sequence.");
-    hid_device* hid = hid_open(HP_VID, REVERB_PID, NULL);
-    if (hid == NULL) {
-	hid = hid_open(HP_VID, REVERB_G2_PID, NULL);
+	LOGI("Starting %s initialization sequence.", priv->hmd_info->debug_name);
+
+	hid_device* hid = hid_open(priv->hmd_info->vid, priv->hmd_info->pid, NULL);
 	if (hid == NULL) {
-	    LOGE("Failed to open the Reverb G2 control device. Check USB permissions");
-	    return false;
-        }
-        LOGI("Initialized Reverb G2.");
-    } else {
-        LOGI("Initialized Reverb.");
-    }
+		LOGE("Failed to open the %s control device. Check USB permissions", priv->hmd_info->debug_name);
+		return false;
+	}
+	priv->hmd_aux = hid;
 
-    priv->hmd_aux = hid;
-    priv->deinit_func = deinit_reverb;
+	// sleep before we start seems to improve reliability
+	// 300ms is what Windows seems to do, so cargo cult that.
+	ohmd_sleep(0.3);
 
-    // sleep before we start seems to improve reliability
-    // 300ms is what Windows seems to do, so cargo cult that.
-    ohmd_sleep(0.3);
+	unsigned char cmd[64] = { 0x50, 0x01, };
+	for (int i = 0; i<4; i++) {
+		hid_send_feature_report(hid, cmd, sizeof(cmd));
+		unsigned char data[64] = { 0x50 };
+		hid_get_feature_report(hid, data, sizeof(data));
+		ohmd_sleep(0.01); // Sleep 10ms
+	}
+	unsigned char data[64] = { 0x09 };
+	hid_get_feature_report(hid, data, sizeof(data));
+	data[0] = 0x08;
+	hid_get_feature_report(hid, data, sizeof(data));
+	data[0] = 0x06;
+	hid_get_feature_report(hid, data, sizeof(data));
 
-    unsigned char cmd[64] = { 0x50, 0x01, };
-    for (int i = 0; i<4; i++) {
-        hid_send_feature_report(hid, cmd, sizeof(cmd));
-        unsigned char data[64] = { 0x50 };
-        hid_get_feature_report(hid, data, sizeof(data));
-        ohmd_sleep(0.01); // Sleep 10ms
-    }
-    unsigned char data[64] = { 0x09 };
-    hid_get_feature_report(hid, data, sizeof(data));
-    data[0] = 0x08;
-    hid_get_feature_report(hid, data, sizeof(data));
-    data[0] = 0x06;
-    hid_get_feature_report(hid, data, sizeof(data));
+	unsigned char cmd_2[2] = { 0x04, 0x01 };
+	hid_send_feature_report(hid, cmd_2, sizeof(cmd_2));
 
-    unsigned char cmd_2[2] = { 0x04, 0x01 };
-    hid_send_feature_report(hid, cmd_2, sizeof(cmd_2));
-
-    return true;
+	LOGI("Initialized %s", priv->hmd_info->debug_name);
+	return true;
 }
 
 static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 {
 	wmr_priv* priv = ohmd_alloc(driver->ctx, sizeof(wmr_priv));
 	unsigned char *config;
-	bool samsung = false;
-	bool reverb = false;
-	bool reverb_g2 = false;
 
 	if(!priv)
 		return NULL;
 
 	priv->base.ctx = driver->ctx;
+
+	/* Default to the GENERIC WMR headset entry: */
+	priv->hmd_info = &headset_map[0];
 
 	int idx = atoi(desc->path);
 
@@ -446,27 +472,24 @@ static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 		goto cleanup;
 
 	//Bunch of temp variables to set to the display configs
-	int resolution_h, resolution_v; 
+	int resolution_h = 1440, resolution_v = 1440;
 
-	// Just read the config (ignoring error 23 fixed this)
-        config = read_config(priv);
-
+	/* Read and parse the config block */
+	config = read_config(priv);
 	if (config) {
 		wmr_config_header* hdr = (wmr_config_header*)config;
-		LOGI("Model name: %.64s\n", hdr->name);
-		if (strncmp(hdr->name,
-			    "Samsung Windows Mixed Reality 800ZAA", 64) == 0) {
-			samsung = true;
-		}
-		if (strncmp(hdr->name,
-			    "HP Reverb VR Headset VR1000-2xxx", 64) == 0) {
-			reverb = true;
-                }
-		if (strncmp(hdr->name,
-			    "HP Reverb Virtual Reality Headset G2", 64) == 0) {
-                       reverb_g2 = true;
-		}
+		int i;
 
+		LOGI("Model name: %.64s\n", hdr->name);
+
+		/* Iterate the headset map for a match (skipping the 0th generic entry) */
+		for (i = 1; i < headset_map_n; i++) {
+			const struct wmr_headset_info *cur = &headset_map[i];
+			if (cur->dev_id_str && strncmp(hdr->name, cur->dev_id_str, 64) == 0) {
+				priv->hmd_info = cur;
+				break;
+			}
+		}
 
 		char *json_data = (char*)config + hdr->json_start + sizeof(uint16_t);
 		const nx_json* json = nx_json_parse(json_data, 0);
@@ -526,53 +549,48 @@ static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 	// Set default device properties
 	ohmd_set_default_device_properties(&priv->base.properties);
 
-        if (reverb) {
-            LOGI("Detected HP Reverb");
-            if (!init_reverb(priv)) {
-	        ohmd_set_error(driver->ctx, "Failed to initialise HP Reverb headset");
-	        goto cleanup;
-            }
-	}
-        if (reverb_g2) {
-            LOGI("Detected HP Reverb G2");
-            if (!init_reverb(priv)) {
-                ohmd_set_error(driver->ctx, "Failed to initialise HP Reverb G2 headset");
-                goto cleanup;
-            }
+	LOGI("Detected WMR headset: %s", priv->hmd_info->debug_name);
+	if (priv->hmd_info->init_func && !priv->hmd_info->init_func(priv)) {
+		ohmd_set_error(driver->ctx, "Failed to initialise %s headset", priv->hmd_info->debug_name);
+		goto cleanup;
 	}
 
 	// Set device properties
-	if (samsung) {
-		// Samsung Odyssey has two 3.5" 1440x1600 OLED displays.
-		priv->base.properties.hsize = 0.118942f;
-		priv->base.properties.vsize = 0.066079f;
-		priv->base.properties.hres = resolution_h;
-		priv->base.properties.vres = resolution_v;
-		priv->base.properties.lens_sep = 0.063f; /* FIXME */
-		priv->base.properties.lens_vpos = 0.03304f; /* FIXME */
-		priv->base.properties.fov = DEG_TO_RAD(110.0f);
-		priv->base.properties.ratio = 0.9f;
-	}
-	if (reverb_g2) {
-		// Settings for Reverb G2 based on Windows Mixed Reality settings.
-		priv->base.properties.hsize = 0.103812f;
-		priv->base.properties.vsize = 0.051905f;
-		priv->base.properties.hres = resolution_h;
-		priv->base.properties.vres = resolution_v;
-		priv->base.properties.lens_sep = 0.063f; /* FIXME */
-		priv->base.properties.lens_vpos = 0.025953f; /* FIXME */ 
-		priv->base.properties.fov = DEG_TO_RAD(114.0f); /* Got this value from HP's website */
-		priv->base.properties.ratio = 1.0f;
-	} else {
-		// Most Windows Mixed Reality Headsets have two 2.89" 1440x1440 LCDs
-		priv->base.properties.hsize = 0.103812f;
-		priv->base.properties.vsize = 0.051905f;
-		priv->base.properties.hres = resolution_h;
-		priv->base.properties.vres = resolution_v;
-		priv->base.properties.lens_sep = 0.063f; /* FIXME */
-		priv->base.properties.lens_vpos = 0.025953f; /* FIXME */
-		priv->base.properties.fov = DEG_TO_RAD(95.0f);
-		priv->base.properties.ratio = 1.0f;
+	switch (priv->hmd_info->hmd_type) {
+		case WMR_HEADSET_GENERIC:
+			// Most Windows Mixed Reality Headsets have two 2.89" 1440x1440 LCDs
+			priv->base.properties.hsize = 0.103812f;
+			priv->base.properties.vsize = 0.051905f;
+			priv->base.properties.hres = resolution_h;
+			priv->base.properties.vres = resolution_v;
+			priv->base.properties.lens_sep = 0.063f; /* FIXME */
+			priv->base.properties.lens_vpos = 0.025953f; /* FIXME */
+			priv->base.properties.fov = DEG_TO_RAD(95.0f);
+			priv->base.properties.ratio = 1.0f;
+			break;
+		case WMR_HEADSET_REVERB_G1:
+		case WMR_HEADSET_REVERB_G2:
+			// Settings for Reverb G2 based on Windows Mixed Reality settings.
+			priv->base.properties.hsize = 0.103812f;
+			priv->base.properties.vsize = 0.051905f;
+			priv->base.properties.hres = resolution_h;
+			priv->base.properties.vres = resolution_v;
+			priv->base.properties.lens_sep = 0.063f; /* FIXME */
+			priv->base.properties.lens_vpos = 0.025953f; /* FIXME */
+			priv->base.properties.fov = DEG_TO_RAD(114.0f); /* Got this value from HP's website */
+			priv->base.properties.ratio = 1.0f;
+			break;
+		case WMR_HEADSET_SAMSUNG_800ZAA:
+			// Samsung Odyssey has two 3.5" 1440x1600 OLED displays.
+			priv->base.properties.hsize = 0.118942f;
+			priv->base.properties.vsize = 0.066079f;
+			priv->base.properties.hres = resolution_h;
+			priv->base.properties.vres = resolution_v;
+			priv->base.properties.lens_sep = 0.063f; /* FIXME */
+			priv->base.properties.lens_vpos = 0.03304f; /* FIXME */
+			priv->base.properties.fov = DEG_TO_RAD(110.0f);
+			priv->base.properties.ratio = 0.9f;
+			break;
 	}
 
 	// calculate projection eye projection matrices from the device properties
